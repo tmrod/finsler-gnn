@@ -1,0 +1,17 @@
+name: finslergraph
+dependencies:
+  - python>=3.10
+  - numpy
+  - scipy
+  - matplotlib
+  - basemap
+  - xarray
+  - netCDF4
+  - h5netcdf
+  - cudnn
+  - conda-forge::jaxlib
+  - conda-forge::jax
+  - optax
+  - equinox
+  - diffrax
+  - sqlite
