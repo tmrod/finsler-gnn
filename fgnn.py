@@ -26,11 +26,13 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Training configuration for the graph neural diffusion model.")
     
     parser.add_argument('--lr', type=float, default=3e-4, help="Learning rate.")
-    parser.add_argument('--steps', type=int, default=1000, help="Training steps.")
+    parser.add_argument('--steps', type=int, default=5000, help="Training steps.")
     parser.add_argument('--M', type=int, default=1, help="Number of initial-final function pairs / batch size.")
     parser.add_argument('--mask_ratio', type=float, default=0.20, help="Ratio of nodes to mask for the SSL task.")
     parser.add_argument('--hidden_dim', type=int, default=64, help="Hidden dimension size of the neural architecture.")
-    
+    parser.add_argument('--euclidean', action=argparse.BooleanOptionalAction, default=True, 
+                        help="Use 2-norm. If not, use 3-norm. Use --no-euclidean to disable.")
+
     parser.add_argument('--use_relu', action=argparse.BooleanOptionalAction, default=True, 
                         help="Enable ReLU activation. Use --no-use_relu to disable.")
     
@@ -52,6 +54,7 @@ mask_ratio = args.mask_ratio
 hidden_dim = args.hidden_dim
 use_relu = args.use_relu
 use_baseline = args.use_baseline
+euclidean = args.euclidean
 expid = args.expid
 
 with open(f'figs/fgnn_{expid}.params', 'w') as f:
@@ -75,12 +78,14 @@ class MetricTransform(ABC, eqx.Module):
 
 class RandersMetric(MetricTransform):
     b: jax.Array
+    p: int
 
-    def __init__(self, b):
+    def __init__(self, b, p=2):
         self.b = b
+        self.p = p
 
     def E(self, xi):
-        norm = jnp.sqrt(jnp.sum(xi**2) + 1e-6)
+        norm = (jnp.sum(jnp.abs(xi)**self.p))**(1/self.p)
         return 0.5 * (norm + jnp.inner(self.b, xi))**2
 
     def J(self, xi):
@@ -194,11 +199,11 @@ def simulate_diffrax(G, f0, t_final, laplacian_fn):
 # Synthetic Data Generation
 # ==========================================
 
-def make_random_fourier_f0(key, X, num_modes=5):
+def make_random_fourier_f0(key, X, num_modes=24):
     d = X.shape[-1]
     k1, k2, k3 = jax.random.split(key, 3)
     
-    freqs = jax.random.uniform(k1, (num_modes, d), minval=1.0, maxval=3.0)
+    freqs = jax.random.uniform(k1, (num_modes, d), minval=1.0, maxval=10.0)
     phases = jax.random.uniform(k2, (num_modes,), minval=0.0, maxval=2*jnp.pi)
     amps = jax.random.normal(k3, (num_modes,))
     
@@ -232,19 +237,25 @@ print('Generating initial conditions')
 key, k0, k1 = jr.split(key, 3)
 f0_train_keys = jr.split(k0, M)
 f0_train = jax.vmap(make_random_fourier_f0, in_axes=(0, None))(f0_train_keys, X_train)
-f0_test_keys = jr.split(k1, M)
-f0_test = jax.vmap(make_random_fourier_f0, in_axes=(0, None))(f0_test_keys, X_test)
+f0_test_keys = jr.split(k1, (16, M))
+f0_test = jax.vmap(jax.vmap(make_random_fourier_f0,
+                            in_axes=(0, None)),
+                   in_axes=(0,None))(f0_test_keys, X_test)
 del k0, k1, f0_train_keys, f0_test_keys
 
 print('Generating target data')
 
-true_metric = RandersMetric(b_true)
+if euclidean:
+    true_metric = RandersMetric(b_true)
+else:
+    true_metric = RandersMetric(b_true, p=3)
+
 true_lap_fn = lambda G, f: G.laplacian(f, true_metric.J)
 
 # def                simulate_diffrax           G,    f, t_fi, lap):
 sim_batch = jax.vmap(simulate_diffrax, in_axes=(None, 0, None, None))
 fT_train = sim_batch(G_train, f0_train, T_int, true_lap_fn)
-fT_test = sim_batch(G_test, f0_test, T_int, true_lap_fn)
+fT_test = jax.vmap(sim_batch, in_axes=(None, 0, None, None))(G_test, f0_test, T_int, true_lap_fn)
 
 print('Initializing neural model and defining loss/eval functions')
 
@@ -336,14 +347,17 @@ print()
 print('Evaluating')
 
 eval_train = eval_model(neural_metric, G_train, f0_train, fT_train, 1-mask_U)
-eval_test = eval_model(neural_metric, G_test, f0_test, fT_test)
+eval_test = jax.vmap(eval_model, in_axes=(None, None, 0, 0))(neural_metric, G_test, f0_test, fT_test)
+eval_test_std = jnp.std(eval_test)
+eval_test = jnp.mean(eval_test)
 
 with open(f'figs/fgnn_{expid}_results.txt', 'w') as f:
     f.write('=====================\n')
     f.write('       Results\n')
     f.write('---------------------\n')
-    f.write(f'Train graph    : {eval_train:.2g}\n')
-    f.write(f'Test graph     : {eval_test:.2g}\n')
+    f.write(f'Train graph       : {eval_train:.2g}\n')
+    f.write(f'Test graph (mean) : {eval_test:.2g}\n')
+    f.write(f'Test graph (std.) : {eval_test_std:.2g}\n')
     f.write('=====================\n')
 
 # ==========================================
